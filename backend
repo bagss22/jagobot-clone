@@ -1,0 +1,100 @@
+// ==== BACKEND ====
+
+// server.js
+const express = require('express');
+const app = express();
+const checkDomain = require('./checkDomain');
+const sendTelegram = require('./telegram');
+require('dotenv').config();
+
+app.use(express.json());
+
+app.post('/add-domain', async (req, res) => {
+  const { domain } = req.body;
+  const status = await checkDomain(domain);
+  await sendTelegram(`Domain: ${domain}\nStatus: ${status}`);
+  res.json({ status: 'ok', domain, result: status });
+});
+
+app.listen(3000, () => console.log('Running on port 3000'));
+
+
+// checkDomain.js
+const puppeteer = require('puppeteer');
+const solveCaptcha = require('./captchaSolver');
+
+module.exports = async function checkDomain(domain) {
+  const browser = await puppeteer.launch({ headless: true });
+  const page = await browser.newPage();
+  await page.goto('https://trustpositif.kominfo.go.id');
+
+  const isCaptcha = await page.$('iframe[src*="recaptcha"]');
+  if (isCaptcha) {
+    const sitekey = await page.$eval('iframe[src*="recaptcha"]', iframe => {
+      const src = iframe.getAttribute('src');
+      const match = src.match(/k=([\w-]+)/);
+      return match ? match[1] : null;
+    });
+    const token = await solveCaptcha(sitekey, page.url());
+    await page.evaluate((token) => {
+      document.getElementById('g-recaptcha-response').innerHTML = token;
+    }, token);
+    await page.click('button');
+    await page.waitForTimeout(10000);
+  }
+
+  await page.type('#form-search input', domain);
+  await Promise.all([
+    page.click('#form-search button'),
+    page.waitForNavigation({ waitUntil: 'domcontentloaded' })
+  ]);
+
+  const html = await page.content();
+  await browser.close();
+
+  if (html.includes('Diblokir')) return 'BLOCKED';
+  if (html.includes('Tidak Diblokir')) return 'SAFE';
+  return 'UNKNOWN';
+};
+
+
+// captchaSolver.js
+const fetch = require('node-fetch');
+
+module.exports = async function solveCaptcha(sitekey, pageurl) {
+  const apiKey = process.env.CAPTCHA_API_KEY;
+  const res = await fetch(`http://2captcha.com/in.php?key=${apiKey}&method=userrecaptcha&googlekey=${sitekey}&pageurl=${pageurl}`);
+  const text = await res.text();
+  if (!text.includes('OK|')) return null;
+  const id = text.split('|')[1];
+
+  await new Promise(r => setTimeout(r, 20000));
+
+  let retries = 0;
+  while (retries < 10) {
+    const result = await fetch(`http://2captcha.com/res.php?key=${apiKey}&action=get&id=${id}`);
+    const resultText = await result.text();
+    if (resultText.includes('OK|')) return resultText.split('|')[1];
+    if (resultText === 'CAPCHA_NOT_READY') {
+      await new Promise(r => setTimeout(r, 5000));
+      retries++;
+    } else {
+      break;
+    }
+  }
+  return null;
+};
+
+
+// telegram.js
+const fetch = require('node-fetch');
+
+module.exports = async function sendTelegram(message) {
+  const bot = process.env.BOT_TOKEN;
+  const chat = process.env.CHAT_ID;
+  await fetch(`https://api.telegram.org/bot${bot}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chat, text: message })
+  });
+};
